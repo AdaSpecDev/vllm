@@ -191,6 +191,7 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
+from vllm.v1.worker.batch_inspect import BatchInspector
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
@@ -499,6 +500,11 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+        self.batch_inspector = (
+            BatchInspector(envs.VLLM_BATCH_INSPECT_DIR)
+            if envs.VLLM_BATCH_INSPECT_DIR
+            else None
+        )
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
@@ -4228,6 +4234,15 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if self.batch_inspector is not None:
+                self.batch_inspector.record(
+                    self.input_batch,
+                    scheduler_output,
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    context_lengths_are_upper_bounds=bool(self.use_async_spec_decode),
+                    microbatched=should_ubatch,
+                )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -6218,6 +6233,9 @@ class GPUModelRunner(
         memory is reclaimable when running in the same process."""
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
+
+        if self.batch_inspector is not None:
+            self.batch_inspector.close()
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
