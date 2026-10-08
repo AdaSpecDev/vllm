@@ -4235,7 +4235,7 @@ class GPUModelRunner(
             ) as kv_connector_output,
         ):
             if self.batch_inspector is not None:
-                self.batch_inspector.record(
+                self.batch_inspector.enqueue_or_drop(
                     self.input_batch,
                     scheduler_output,
                     num_tokens_padded=num_tokens_padded,
