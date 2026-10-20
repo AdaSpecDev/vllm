@@ -43,7 +43,9 @@ class TestNativeStatistics(unittest.TestCase):
             )
             iteration = IterationStats()
             iteration.iteration_timestamp = 14.0
-            output = EngineCoreOutput(request_id=request.request_id, new_token_ids=[1])
+            output = EngineCoreOutput(
+                request_id=request.request_id, new_token_ids=[1], inspection_step_id=42
+            )
             processor._update_stats_from_output(request, output, 100.0, iteration)
             request.is_prefilling = False
             iteration.iteration_timestamp = 17.0
@@ -55,6 +57,8 @@ class TestNativeStatistics(unittest.TestCase):
             )
             self.assertTrue(writer.close())
             first, following, finished, summary = records(writer)
+            self.assertEqual(first["step"], 42)
+            self.assertEqual(following["step"], 42)
             self.assertEqual(first["time_to_first_token_seconds"], 4.0)
             self.assertEqual(following["inter_output_latency_seconds"], 3.0)
             self.assertEqual(following["emitted_tokens"], 2)
@@ -124,6 +128,7 @@ class TestNativeStatistics(unittest.TestCase):
             metadata, counters, summary = records(writer)
             self.assertEqual(metadata["step"], counters["step"])
             self.assertEqual(counters["step"], 42)
+            self.assertEqual(output.outputs[0].inspection_step_id, 42)
             self.assertEqual(counters["speculative"]["num_draft_tokens"], 3)
             self.assertEqual(counters["speculative"]["num_accepted_tokens"], 2)
             self.assertEqual(

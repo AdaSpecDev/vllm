@@ -800,6 +800,7 @@ class OutputProcessor:
             self.inspection_logger.enqueue_statistics(
                 {
                     "type": "request_output",
+                    "step": engine_core_output.inspection_step_id,
                     "request_id": req_state.external_req_id,
                     "internal_request_id": req_state.request_id,
                     "engine_monotonic_seconds": engine_core_timestamp,

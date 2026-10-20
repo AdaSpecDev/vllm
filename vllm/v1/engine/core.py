@@ -116,6 +116,26 @@ class EngineCore:
                 vllm_config,
             )
 
+        if envs.VLLM_BATCH_INSPECT_TIMING:
+            # This first timing path deliberately uses one eager, synchronous GPU.
+            parallel = vllm_config.parallel_config
+            if (
+                not envs.VLLM_BATCH_INSPECT_DIR
+                or not log_stats
+                or vllm_config.device_config.device_type != "cuda"
+                or vllm_config.use_v2_model_runner
+                or vllm_config.model_config.runner_type != "generate"
+                or not vllm_config.model_config.enforce_eager
+                or vllm_config.scheduler_config.async_scheduling
+                or parallel.world_size_across_dp != 1
+                or parallel.use_ubatching
+            ):
+                raise ValueError(
+                    "Batch timing requires VLLM_BATCH_INSPECT_DIR, native statistics, "
+                    "the v1 generation runner, one CUDA GPU, enforce_eager=True, "
+                    "async_scheduling=False, and no microbatching."
+                )
+
         self.log_stats = log_stats
         self._inspection_step = 0
 
