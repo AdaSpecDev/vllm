@@ -31,6 +31,7 @@ def main():
     os.environ["VLLM_BATCH_INSPECT_DIR"] = str(directory)
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     from vllm import LLM, SamplingParams
+    from vllm.v1.worker.batch_inspect import close_statistics_loggers
 
     # Synchronous scheduling gives exact CPU lengths; prefix reuse is disabled.
     llm = LLM(
@@ -58,8 +59,6 @@ def main():
         raise RuntimeError("Writer did not finish cleanly")
     # Emit the final native throughput window and drain the frontend's writer.
     llm.llm_engine.do_log_stats()
-    from vllm.v1.worker.batch_inspect import close_statistics_loggers
-
     if not close_statistics_loggers():
         raise RuntimeError("Frontend statistics did not finish cleanly")
     # Shutting down the engine drains its own statistics writer.
