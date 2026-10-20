@@ -82,6 +82,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
+from vllm.v1.worker.batch_inspect import close_statistics_loggers, get_statistics_logger
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -116,9 +117,11 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self._inspection_step = 0
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
+        self.inspection_logger = get_statistics_logger("engine")
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
@@ -437,6 +440,9 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        if self.inspection_logger is not None:
+            self._inspection_step += 1
+            scheduler_output.inspection_step_id = self._inspection_step
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -453,6 +459,10 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if self.inspection_logger is not None:
+            self.inspection_logger.record_engine_step(
+                scheduler_output, engine_core_outputs
+            )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -495,6 +505,9 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            if self.inspection_logger is not None:
+                self._inspection_step += 1
+                scheduler_output.inspection_step_id = self._inspection_step
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -557,6 +570,10 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if self.inspection_logger is not None:
+            self.inspection_logger.record_engine_step(
+                scheduler_output, engine_core_outputs
+            )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -595,6 +612,7 @@ class EngineCore:
             self.abort_requests(request_ids)
 
     def shutdown(self):
+        close_statistics_loggers()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()

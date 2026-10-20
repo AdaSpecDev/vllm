@@ -4242,6 +4242,7 @@ class GPUModelRunner(
                     num_reqs_padded=num_reqs_padded,
                     context_lengths_are_upper_bounds=bool(self.use_async_spec_decode),
                     microbatched=should_ubatch,
+                    step_id=scheduler_output.inspection_step_id,
                 )
             model_output = self._model_forward(
                 input_ids=input_ids,

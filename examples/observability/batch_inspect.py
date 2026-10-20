@@ -37,6 +37,7 @@ def main():
         model="Qwen/Qwen3-0.6B",
         revision="c1899de289a04d12100db370d81485cdf75e47ca",
         async_scheduling=False,
+        disable_log_stats=False,
         enable_prefix_caching=False,
         enforce_eager=True,
         max_model_len=512,
@@ -55,6 +56,14 @@ def main():
     # collective_rpc invokes the callback on each worker, closing its local writer.
     if not all(llm.collective_rpc(close_inspector)):
         raise RuntimeError("Writer did not finish cleanly")
+    # Emit the final native throughput window and drain the frontend's writer.
+    llm.llm_engine.do_log_stats()
+    from vllm.v1.worker.batch_inspect import close_statistics_loggers
+
+    if not close_statistics_loggers():
+        raise RuntimeError("Frontend statistics did not finish cleanly")
+    # Shutting down the engine drains its own statistics writer.
+    llm.llm_engine.engine_core.shutdown()
     # Each RequestOutput supplies an ID and prompt tokens for the live-log tests.
     expected = {out.request_id: len(out.prompt_token_ids) for out in outputs}
     (directory / "requests.json").write_text(json.dumps(expected), encoding="utf-8")

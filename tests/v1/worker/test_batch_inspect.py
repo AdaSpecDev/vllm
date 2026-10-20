@@ -270,7 +270,18 @@ class TestOfflineExample(unittest.TestCase):
         directory = Path(os.environ["VLLM_BATCH_INSPECT_DIR"]).expanduser()
         expected = json.loads((directory / "requests.json").read_text())
         self.assertEqual(sorted(expected.values()), [16, 64, 128])
-        validate_live_batches(list(directory.glob("batch-*.jsonl")), expected)
+        request_records = [
+            json.loads(line)
+            for path in directory.glob("frontend-*.jsonl")
+            for line in path.read_text().splitlines()
+        ]
+        internal_expected = {
+            row["internal_request_id"]: expected[row["request_id"]]
+            for row in request_records
+            if row["type"] == "request"
+        }
+        self.assertEqual(len(internal_expected), len(expected))
+        validate_live_batches(list(directory.glob("batch-*.jsonl")), internal_expected)
 
 
 if __name__ == "__main__":
