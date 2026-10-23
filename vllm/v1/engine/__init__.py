@@ -193,6 +193,9 @@ class EngineCoreOutput(
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
 
+    # Match frontend output intervals to the worker batch and phase timings.
+    inspection_step_id: int | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

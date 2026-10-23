@@ -5,21 +5,30 @@
 The runner supplies CPU metadata; a daemon thread serializes and writes JSONL.
 Full queues drop records. CPU collection and the writer still add GIL overhead.
 Abrupt exits can lose buffered records; a clean close writes a loss summary.
+VLLM_BATCH_INSPECT_TIMING=1 adds CPU and CUDA stream elapsed milliseconds.
+The writer polls GPU events; the inference thread never waits for these events.
+CPU and GPU durations overlap and must not be added together.
 """
 
+import atexit
 import json
 import logging
 import os
 import socket
+import time
+from dataclasses import asdict
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any, TextIO
 from uuid import uuid4
 
+import vllm.envs as envs
 from vllm.v1.worker.batch_metadata import BatchMetadata
 
 if TYPE_CHECKING:
+    import torch
+
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
@@ -29,17 +38,25 @@ logger = logging.getLogger(__name__)
 class BatchInspector:
     """Shared collector: one runner producer, a bounded queue, and one writer."""
 
-    def __init__(self, directory: str, queue_capacity: int = 1024) -> None:
+    def __init__(
+        self, directory: str, queue_capacity: int = 1024, *, role: str = "batch"
+    ) -> None:
         """Start a writer with a unique output file for this GPU worker process."""
         if queue_capacity < 1:
             raise ValueError("queue_capacity must be positive")
         self.path = Path(directory) / (
-            f"batch-{socket.gethostname()}-{os.getpid()}-{uuid4().hex[:8]}.jsonl"
+            f"{role}-{socket.gethostname()}-{os.getpid()}-{uuid4().hex[:8]}.jsonl"
         )
-        self._queue: Queue[BatchMetadata] = Queue(maxsize=queue_capacity)
+        self._queue: Queue[BatchMetadata | dict[str, Any]] = Queue(
+            maxsize=queue_capacity
+        )
         self._closing = Event()
         self._failed = Event()
+        self._close_deadline = float("inf")
+        self._timing_disabled = False
+        self.timings_incomplete = 0
         self.steps = 0
+        self.statistics_records = 0
         self.dropped = 0
         self._thread = Thread(target=self._write, name="batch-inspector", daemon=True)
         self._thread.start()
@@ -53,6 +70,7 @@ class BatchInspector:
         num_reqs_padded: int,
         context_lengths_are_upper_bounds: bool,
         microbatched: bool = False,
+        step_id: int | None = None,
     ) -> bool:
         """Capture CPU batch metadata and enqueue it without waiting for space."""
         self.steps += 1
@@ -63,7 +81,7 @@ class BatchInspector:
         metadata = BatchMetadata.from_batch(
             batch,
             scheduler,
-            step=self.steps,
+            step=self.steps if step_id is None else step_id,
             num_tokens_padded=num_tokens_padded,
             num_reqs_padded=num_reqs_padded,
             context_lengths_are_upper_bounds=context_lengths_are_upper_bounds,
@@ -76,11 +94,128 @@ class BatchInspector:
             self.dropped += 1
             return False
 
+    def enqueue_statistics(self, record: dict[str, Any]) -> bool:
+        """Send owned CPU values to the same writer without waiting for space."""
+        self.statistics_records += 1
+        if self._closing.is_set() or self._failed.is_set():
+            self.dropped += 1
+            return False
+        try:
+            self._queue.put_nowait(record)
+            return True
+        except Full:
+            self.dropped += 1
+            return False
+
+    def start_timing(
+        self, device: "torch.device | str"
+    ) -> tuple[Any, Any, Any, int] | None:
+        """Record a GPU start marker and CPU clock; never wait for GPU completion."""
+        if not envs.VLLM_BATCH_INSPECT_TIMING or self._timing_disabled:
+            return None
+        if self._closing.is_set() or self._failed.is_set() or self._queue.full():
+            self.statistics_records += 1
+            self.dropped += 1
+            return None
+        import torch
+
+        try:
+            # Both events belong to this worker's current CUDA stream.
+            start = torch.Event(device=device, enable_timing=True)
+            end = torch.Event(device=device, enable_timing=True)
+            stream = torch.accelerator.current_stream(device)
+            start.record(stream)
+            return start, end, stream, time.perf_counter_ns()
+        except RuntimeError:
+            self._disable_timing()
+            return None
+
+    def end_timing(
+        self, timer: tuple[Any, Any, Any, int] | None, *, step: int, phase: str
+    ) -> None:
+        """Record the end marker and enqueue event handles for the writer thread."""
+        if timer is None:
+            return
+        start, end, stream, cpu_start = timer
+        cpu_elapsed_ms = (time.perf_counter_ns() - cpu_start) / 1_000_000
+        try:
+            end.record(stream)
+        except RuntimeError:
+            self._disable_timing()
+            return
+        self.enqueue_statistics(
+            {
+                "type": "timing",
+                "step": step,
+                "phase": phase,
+                "cpu_elapsed_ms": cpu_elapsed_ms,
+                # Only the writer consumes these handles; no tensors are copied.
+                "_gpu_events": (start, end),
+            }
+        )
+
+    def _disable_timing(self) -> None:
+        """Keep metadata collection running if CUDA measurement itself fails."""
+        self.timings_incomplete += 1
+        self._timing_disabled = True
+        logger.warning(
+            "Batch GPU timing disabled after a CUDA event error", exc_info=True
+        )
+
+    def _resolve_timing(self, record: dict[str, Any]) -> None:
+        """Poll CUDA completion in the writer, with a deadline during shutdown."""
+        start, end = record.pop("_gpu_events")
+        record["gpu_elapsed_ms"] = None
+        record["gpu_timing_status"] = "incomplete"
+        try:
+            while not end.query():
+                if time.monotonic() >= self._close_deadline:
+                    self.timings_incomplete += 1
+                    return
+                time.sleep(0.001)
+            # Stream elapsed time includes idle gaps; it is not pure GPU busy time.
+            record["gpu_elapsed_ms"] = start.elapsed_time(end)
+            record["gpu_timing_status"] = "complete"
+        except RuntimeError:
+            self.timings_incomplete += 1
+            record["gpu_timing_status"] = "error"
+            logger.warning("Could not read batch GPU timing", exc_info=True)
+
+    def record_engine_step(self, scheduler, outputs) -> None:
+        """Export native scheduler counters and emitted tokens for this step."""
+        speculative = None
+        emitted: list[dict[str, Any]] = []
+        for output in outputs.values():
+            stats = output.scheduler_stats
+            if stats is not None and stats.spec_decoding_stats is not None:
+                speculative = asdict(stats.spec_decoding_stats)
+            for item in output.outputs:
+                item.inspection_step_id = scheduler.inspection_step_id
+                emitted.append(
+                    {
+                        "request_id": item.request_id,
+                        "emitted_tokens": len(item.new_token_ids),
+                    }
+                )
+        self.enqueue_statistics(
+            {
+                "type": "engine_step",
+                "step": scheduler.inspection_step_id,
+                "requests": emitted,
+                "speculative": speculative,
+            }
+        )
+
     def close(self, timeout: float = 2.0) -> bool:
         """Drain queued metadata at shutdown; False means incomplete output."""
+        self._close_deadline = time.monotonic() + timeout
         self._closing.set()
         self._thread.join(timeout=timeout)
-        return not self._thread.is_alive() and not self._failed.is_set()
+        return (
+            not self._thread.is_alive()
+            and not self._failed.is_set()
+            and not self.timings_incomplete
+        )
 
     @staticmethod
     def _write_record(stream: TextIO, record: dict[str, Any]) -> None:
@@ -91,6 +226,7 @@ class BatchInspector:
     def _write(self) -> None:
         """Consume BatchMetadata objects until close, then write a loss summary."""
         written = 0
+        statistics_written = 0
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("x", encoding="utf-8") as stream:
@@ -99,8 +235,14 @@ class BatchInspector:
                         metadata = self._queue.get(timeout=0.1)
                     except Empty:
                         continue
-                    self._write_record(stream, metadata.to_dict())
-                    written += 1
+                    if isinstance(metadata, BatchMetadata):
+                        self._write_record(stream, metadata.to_dict())
+                        written += 1
+                    else:
+                        if "_gpu_events" in metadata:
+                            self._resolve_timing(metadata)
+                        self._write_record(stream, metadata)
+                        statistics_written += 1
                 self._write_record(
                     stream,
                     {
@@ -108,6 +250,19 @@ class BatchInspector:
                         "steps": self.steps,
                         "written": written,
                         "dropped": self.dropped,
+                        **(
+                            {"timings_incomplete": self.timings_incomplete}
+                            if self.timings_incomplete
+                            else {}
+                        ),
+                        **(
+                            {
+                                "statistics_records": self.statistics_records,
+                                "statistics_written": statistics_written,
+                            }
+                            if self.statistics_records
+                            else {}
+                        ),
                     },
                 )
         except OSError:
@@ -116,3 +271,33 @@ class BatchInspector:
             logger.warning(
                 "Batch inspection disabled: cannot write %s", self.path, exc_info=True
             )
+
+
+_statistics_loggers: dict[tuple[int, str, str], BatchInspector] = {}
+
+
+def get_statistics_logger(role: str) -> BatchInspector | None:
+    """Reuse one CPU statistics writer per process and role when logging is enabled."""
+    directory = envs.VLLM_BATCH_INSPECT_DIR
+    if not directory:
+        return None
+    key = (os.getpid(), role, directory)
+    if key not in _statistics_loggers:
+        _statistics_loggers[key] = BatchInspector(directory, role=role)
+    return _statistics_loggers[key]
+
+
+def close_statistics_loggers() -> bool:
+    """Drain all statistics writers owned by this process, including on normal exit."""
+    owned = [
+        (key, writer)
+        for key, writer in _statistics_loggers.items()
+        if key[0] == os.getpid()
+    ]
+    results = [writer.close() for _, writer in owned]
+    for key, _ in owned:
+        del _statistics_loggers[key]
+    return all(results)
+
+
+atexit.register(close_statistics_loggers)

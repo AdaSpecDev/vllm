@@ -29,6 +29,7 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
+from vllm.v1.worker.batch_inspect import get_statistics_logger
 
 logger = init_logger(__name__)
 
@@ -99,6 +100,7 @@ class AggregateStatLoggerBase(StatLoggerBase):
 class LoggingStatLogger(StatLoggerBase):
     def __init__(self, vllm_config: VllmConfig, engine_index: int = 0):
         self.engine_index = engine_index
+        self.inspection_logger = get_statistics_logger("frontend")
         self.vllm_config = vllm_config
         self._reset(time.monotonic())
 
@@ -197,6 +199,19 @@ class LoggingStatLogger(StatLoggerBase):
         now = time.monotonic()
         prompt_throughput = self._get_throughput(self.num_prompt_tokens, now)
         generation_throughput = self._get_throughput(self.num_generation_tokens, now)
+        if self.inspection_logger is not None:
+            self.inspection_logger.enqueue_statistics(
+                {
+                    "type": "throughput",
+                    "engine_index": self.engine_index,
+                    "window_start_monotonic_seconds": self.last_log_time,
+                    "window_end_monotonic_seconds": now,
+                    "generated_tokens": self.num_generation_tokens,
+                    "generated_tokens_per_second": generation_throughput,
+                    "computed_prompt_tokens": self.num_prompt_tokens,
+                    "computed_prompt_tokens_per_second": prompt_throughput,
+                }
+            )
 
         self._reset(now)
         self.engine_is_idle = not any(

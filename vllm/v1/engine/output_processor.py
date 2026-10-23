@@ -37,6 +37,7 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+from vllm.v1.worker.batch_inspect import get_statistics_logger
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -426,6 +427,9 @@ class OutputProcessor:
         tracing_enabled: bool = False,
     ):
         self.log_stats = log_stats
+        self.inspection_logger = (
+            get_statistics_logger("frontend") if log_stats else None
+        )
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
         self.request_states: dict[str, RequestState] = {}
@@ -792,6 +796,24 @@ class OutputProcessor:
             req_state.lora_name,
         )
 
+        if self.inspection_logger is not None:
+            self.inspection_logger.enqueue_statistics(
+                {
+                    "type": "request_output",
+                    "step": engine_core_output.inspection_step_id,
+                    "request_id": req_state.external_req_id,
+                    "internal_request_id": req_state.request_id,
+                    "engine_monotonic_seconds": engine_core_timestamp,
+                    "emitted_tokens": len(engine_core_output.new_token_ids),
+                    "time_to_first_token_seconds": req_state.stats.first_token_latency
+                    if req_state.is_prefilling
+                    else None,
+                    "inter_output_latency_seconds": None
+                    if req_state.is_prefilling
+                    else iteration_stats.inter_token_latencies_iter[-1],
+                }
+            )
+
     def _update_stats_from_finished(
         self,
         req_state: RequestState,
@@ -811,6 +833,29 @@ class OutputProcessor:
             req_stats=req_state.stats,
             num_cached_tokens=req_state.num_cached_tokens,
         )
+        if self.inspection_logger is not None:
+            finished = iteration_stats.finished_requests[-1]
+            self.inspection_logger.enqueue_statistics(
+                {
+                    "type": "request",
+                    "request_id": req_state.external_req_id,
+                    "internal_request_id": req_state.request_id,
+                    "time_to_first_token_seconds": req_state.stats.first_token_latency
+                    if finished.num_generation_tokens
+                    else None,
+                    "request_latency_seconds": finished.e2e_latency,
+                    "queue_wait_seconds": finished.queued_time,
+                    "prefill_seconds": finished.prefill_time,
+                    "decode_seconds": finished.decode_time,
+                    "mean_time_per_output_token_seconds": (
+                        finished.mean_time_per_output_token
+                    ),
+                    "prompt_tokens": finished.num_prompt_tokens,
+                    "generated_tokens": finished.num_generation_tokens,
+                    "cached_tokens": finished.num_cached_tokens,
+                    "finish_reason": str(finish_reason),
+                }
+            )
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 
         ParentRequest.observe_finished_request(
